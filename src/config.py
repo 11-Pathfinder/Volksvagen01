@@ -4,31 +4,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env(key: str, default: str = "") -> str:
+    """Get env var, treating empty strings as unset (falls back to default)."""
+    value = os.getenv(key, "")
+    return value if value else default
+
+
+def _env_int(key: str, default: int) -> int:
+    """Get env var as int, treating empty/missing as the default."""
+    value = os.getenv(key, "")
+    return int(value) if value else default
+
+
 class Config:
     # VW Scraper
     VW_BASE_URL = "https://usedcars.volkswagen.co.uk"
     VW_SEARCH_URL = f"{VW_BASE_URL}/en/vehicle_search/volkswagen/all-models"
-    VW_POSTCODE = os.getenv("VW_POSTCODE", "SW1A 1AA")
-    VW_RADIUS_MILES = int(os.getenv("VW_RADIUS_MILES", "50"))
-    VW_MAX_PAGES = int(os.getenv("VW_MAX_PAGES", "10"))
+    VW_POSTCODE = _env("VW_POSTCODE", "SW1A 1AA")
+    VW_RADIUS_MILES = _env_int("VW_RADIUS_MILES", 50)
+    VW_MAX_PAGES = _env_int("VW_MAX_PAGES", 10)
 
     # Optional filters
-    VW_MAX_PRICE = os.getenv("VW_MAX_PRICE")  # e.g. "25000"
-    VW_MAX_MILEAGE = os.getenv("VW_MAX_MILEAGE")  # e.g. "50000"
-    VW_MIN_YEAR = os.getenv("VW_MIN_YEAR")  # e.g. "2020"
-    VW_MODELS = os.getenv("VW_MODELS", "")  # comma-separated, e.g. "golf,polo,tiguan"
+    VW_MAX_PRICE = _env("VW_MAX_PRICE")
+    VW_MAX_MILEAGE = _env("VW_MAX_MILEAGE")
+    VW_MIN_YEAR = _env("VW_MIN_YEAR")
+    VW_MODELS = _env("VW_MODELS")
 
     # AutoTrader valuation
     AT_BASE_URL = "https://www.autotrader.co.uk"
-    AT_POSTCODE = os.getenv("AT_POSTCODE", VW_POSTCODE)
+    AT_POSTCODE = _env("AT_POSTCODE", VW_POSTCODE)
 
     # Email
-    SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-    SMTP_USER = os.getenv("SMTP_USER", "")
-    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-    EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
-    EMAIL_TO = os.getenv("EMAIL_TO", "")
+    SMTP_HOST = _env("SMTP_HOST", "smtp.gmail.com")
+    SMTP_PORT = _env_int("SMTP_PORT", 587)
+    SMTP_USER = _env("SMTP_USER")
+    SMTP_PASSWORD = _env("SMTP_PASSWORD")
+    EMAIL_FROM = _env("EMAIL_FROM", _env("SMTP_USER"))
+    EMAIL_TO = _env("EMAIL_TO")
 
     @classmethod
     def get_model_filters(cls) -> list[str]:
