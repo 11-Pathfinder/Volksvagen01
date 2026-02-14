@@ -42,7 +42,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python main.py --save-html report.html
+        run: python main.py -v --save-html report.html
 
       - name: Upload report artifact
         if: always()
@@ -51,3 +51,11 @@ jobs:
           name: daily-report-${{ github.run_number }}
           path: report.html
           retention-days: 30
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-${{ github.run_number }}
+          path: debug/
+          retention-days: 7

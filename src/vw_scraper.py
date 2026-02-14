@@ -4,9 +4,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 from src.config import Config
+
+DEBUG_DIR = Path("debug")
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +272,52 @@ def _handle_postcode_entry(page: Page) -> None:
             continue
 
 
+def _save_debug_api(api_data: list[dict]) -> None:
+    """Save intercepted API responses to debug/ for inspection."""
+    try:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        for i, item in enumerate(api_data):
+            path = DEBUG_DIR / f"api_response_{i}.json"
+            # Save URL and a summary of the data structure
+            debug_info = {
+                "url": item.get("url", ""),
+                "top_level_keys": list(item.get("data", {}).keys()) if isinstance(item.get("data"), dict) else f"type={type(item.get('data')).__name__}",
+                "raw_data": item.get("data"),
+            }
+            path.write_text(json.dumps(debug_info, indent=2, default=str))
+            logger.info(f"Debug: saved API response to {path}")
+            # Log the structure summary
+            data = item.get("data", {})
+            if isinstance(data, dict):
+                logger.info(f"Debug: API response keys: {list(data.keys())}")
+                for key, val in data.items():
+                    if isinstance(val, list):
+                        logger.info(f"Debug:   '{key}' is a list with {len(val)} items")
+                        if val and isinstance(val[0], dict):
+                            logger.info(f"Debug:   first item keys: {list(val[0].keys())}")
+                    elif isinstance(val, dict):
+                        logger.info(f"Debug:   '{key}' is a dict with keys: {list(val.keys())}")
+                    else:
+                        logger.info(f"Debug:   '{key}' = {repr(val)[:100]}")
+            elif isinstance(data, list):
+                logger.info(f"Debug: API response is a list with {len(data)} items")
+    except Exception as e:
+        logger.debug(f"Failed to save debug API data: {e}")
+
+
+def _save_debug_page(page: Page) -> None:
+    """Save a screenshot and HTML dump for debugging."""
+    try:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        page.screenshot(path=str(DEBUG_DIR / "page_screenshot.png"), full_page=True)
+        logger.info("Debug: saved screenshot to debug/page_screenshot.png")
+        html = page.content()
+        (DEBUG_DIR / "page_source.html").write_text(html)
+        logger.info(f"Debug: saved page HTML ({len(html)} chars) to debug/page_source.html")
+    except Exception as e:
+        logger.debug(f"Failed to save debug page data: {e}")
+
+
 def scrape_vw_listings() -> list[VWListing]:
     """Main entry point: scrape VW used car listings and return structured data."""
     logger.info("Starting VW used car scraper")
@@ -293,6 +342,7 @@ def scrape_vw_listings() -> list[VWListing]:
 
             if api_data:
                 logger.info(f"Intercepted {len(api_data)} API responses")
+                _save_debug_api(api_data)
                 all_listings = _parse_listings_from_api(api_data)
                 if all_listings:
                     logger.info(f"Parsed {len(all_listings)} listings from API data")
@@ -305,6 +355,9 @@ def scrape_vw_listings() -> list[VWListing]:
 
                 # Wait for content to load
                 page.wait_for_timeout(3000)
+
+                # Save debug screenshot and HTML
+                _save_debug_page(page)
 
                 # Parse current page
                 all_listings = _parse_listings_from_html(page)
