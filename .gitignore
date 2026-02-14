@@ -9,3 +9,4 @@ report.html
 dist/
 build/
 .pytest_cache/
+debug/

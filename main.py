@@ -30,10 +30,35 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--save-html", type=str, metavar="FILE", help="Save HTML report to file")
     parser.add_argument("--delay", type=float, default=2.0, help="Delay between AutoTrader requests in seconds (default: 2.0)")
+    parser.add_argument("--debug-only", action="store_true",
+                        help="Run scraper to capture debug artifacts only (no parsing, no report)")
 
     args = parser.parse_args()
     setup_logging(args.verbose)
     logger = logging.getLogger("main")
+
+    if args.debug_only:
+        logger.info("Running in debug-only mode — use debug_scraper.py for richer diagnostics")
+        from debug_scraper import diagnose_url, DEBUG_DIR as DBG_DIR
+        from src.config import Config
+        from playwright.sync_api import sync_playwright
+        DBG_DIR.mkdir(exist_ok=True)
+        urls = Config.get_search_urls()
+        logger.info(f"URLs: {urls}")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = ctx.new_page()
+            for url in urls:
+                summary = diagnose_url(page, url)
+                logger.info(f"{url} → {summary.get('prices_on_page', 0)} prices, "
+                            f"{summary.get('card_candidates_found', 0)} card candidates")
+            browser.close()
+        logger.info(f"Debug artifacts saved to {DBG_DIR}/")
+        return 0
 
     # Step 1: Scrape VW listings
     logger.info("Step 1/3: Scraping VW used car listings...")
