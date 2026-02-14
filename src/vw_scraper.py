@@ -46,20 +46,47 @@ def _extract_year(text: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _extract_mileage(text: str) -> int:
+    """Extract mileage from text like '12,345 miles' or '12345 miles'."""
+    match = re.search(r"([\d,]+)\s*miles?\b", text, re.IGNORECASE)
+    if match:
+        return _extract_int(match.group(1))
+    return 0
+
+
+def _extract_price(text: str) -> int:
+    """Extract the main GBP price from text (ignoring monthly payments)."""
+    # Find all £ prices
+    prices = re.findall(r"£([\d,]+)", text)
+    for p in prices:
+        val = _extract_int(p)
+        if val > 500:  # Skip monthly payment amounts
+            return val
+    return 0
+
+
+# Ordered longest-first so "id.7 tourer" matches before "id.7"
+VW_MODELS = [
+    "id. buzz", "id.7 tourer", "id.3", "id.4", "id.5", "id.7",
+    "golf gti", "golf gte", "golf gtd", "golf r", "golf estate",
+    "golf sv", "golf",
+    "t-roc cabriolet", "t-roc", "t-cross",
+    "tiguan allspace", "tiguan", "touareg", "touran", "tayron",
+    "polo", "taigo", "passat estate", "passat", "arteon",
+    "multivan", "up!", "e-up!", "e-golf", "sharan", "caravelle",
+]
+
+
 def _detect_model(text: str) -> str:
     """Detect VW model name from text."""
     text_lower = text.lower()
-    models = [
-        "id. buzz", "id.7 tourer", "id.3", "id.4", "id.5", "id.7",
-        "golf gti", "golf gte", "golf gtd", "golf r", "golf estate",
-        "golf sv", "golf",
-        "t-roc cabriolet", "t-roc", "t-cross",
-        "tiguan allspace", "tiguan", "touareg", "touran", "tayron",
-        "polo", "taigo", "passat estate", "passat", "arteon",
-        "multivan", "up!", "e-up!", "e-golf", "sharan", "caravelle",
-    ]
-    for m in models:
+    for m in VW_MODELS:
         if m in text_lower:
+            # Preserve canonical casing for ID models
+            if m.startswith("id."):
+                return "ID." + m[3:].upper().strip()
+            if m == "id. buzz":
+                return "ID. Buzz"
             return m.title()
     return ""
 
@@ -237,61 +264,53 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
 
 def _parse_listings_from_dom(page: Page) -> list[VWListing]:
     """Extract vehicle listings by running JavaScript in the browser to find car cards."""
-    # Use JavaScript to find all elements containing a £ price and a vehicle link
     raw_listings = page.evaluate("""() => {
         const results = [];
+        const processedHrefs = new Set();
 
-        // Strategy 1: Find all links that point to vehicle detail pages
-        const vehicleLinks = document.querySelectorAll('a[href*="/vehicle/"], a[href*="/car/"], a[href*="/detail/"]');
-        const processed = new Set();
+        // Find all links that point to individual vehicle detail pages.
+        // These URLs typically look like /en/vehicle/<id>/...
+        const vehicleLinks = document.querySelectorAll(
+            'a[href*="/vehicle/"], a[href*="/car/"], a[href*="/detail/"]'
+        );
 
         for (const link of vehicleLinks) {
-            // Walk up to find the card container (usually 2-4 levels up)
+            const href = link.getAttribute('href') || '';
+            // Skip non-detail links (e.g. /vehicle_search/ is the listing page, not a car)
+            if (href.includes('vehicle_search') || href.includes('vehicle-search')) continue;
+            if (processedHrefs.has(href)) continue;
+            processedHrefs.add(href);
+
+            // Find the tightest containing card element.
+            // Walk up looking for the smallest ancestor that contains both
+            // a price (£) and some car info, but is NOT the whole page.
             let card = link;
-            for (let i = 0; i < 5; i++) {
-                if (card.parentElement) card = card.parentElement;
+            const maxTextLen = 3000;
+            for (let i = 0; i < 6; i++) {
+                if (!card.parentElement) break;
+                const parent = card.parentElement;
+                const parentText = parent.innerText || '';
+                // Stop if the parent is too large (likely a page-level container)
+                if (parentText.length > maxTextLen) break;
+                card = parent;
             }
 
-            // Skip if we've already processed this card
-            const cardId = card.getAttribute('data-id') || card.innerHTML.substring(0, 100);
-            if (processed.has(cardId)) continue;
-            processed.add(cardId);
-
             const text = card.innerText || '';
-            const href = link.getAttribute('href') || '';
+            // Skip if this is clearly a navigation/model-picker element
+            // (contains multiple "From £" entries which is the model list sidebar)
+            const fromPriceCount = (text.match(/From\s+£/gi) || []).length;
+            if (fromPriceCount > 2) continue;
+
+            // Must have a price to be a valid listing
+            if (!text.includes('£')) continue;
+
+            // Skip very short text (probably just a link) or very long (page section)
+            if (text.length < 30 || text.length > maxTextLen) continue;
+
             const img = card.querySelector('img');
             const imgSrc = img ? (img.getAttribute('src') || img.getAttribute('data-src') || '') : '';
 
-            // Only include if it has a price
-            if (text.includes('£')) {
-                results.push({ text, href, imgSrc });
-            }
-        }
-
-        // Strategy 2: If strategy 1 found nothing, find all elements with £ prices
-        if (results.length === 0) {
-            // Find elements that contain price-like text
-            const allElements = document.querySelectorAll('div, article, section, li');
-            for (const el of allElements) {
-                const text = el.innerText || '';
-                // Look for elements that have a price AND car-related text
-                if (text.includes('£') && text.length > 50 && text.length < 2000) {
-                    const hasCarInfo = /(?:mile|petrol|diesel|electric|hybrid|manual|automatic)/i.test(text);
-                    const hasModel = /(?:golf|polo|tiguan|t-roc|t-cross|id\\.3|id\\.4|id\\.5|id\\.7|touareg|passat|arteon|taigo|tayron)/i.test(text);
-                    if (hasCarInfo || hasModel) {
-                        const link = el.querySelector('a[href*="/vehicle/"], a[href*="/car/"], a');
-                        const href = link ? link.getAttribute('href') || '' : '';
-                        const img = el.querySelector('img');
-                        const imgSrc = img ? (img.getAttribute('src') || '') : '';
-
-                        const elId = text.substring(0, 100);
-                        if (!processed.has(elId)) {
-                            processed.add(elId);
-                            results.push({ text, href, imgSrc });
-                        }
-                    }
-                }
-            }
+            results.push({ text, href, imgSrc });
         }
 
         return results;
@@ -308,41 +327,39 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
         if href and not href.startswith("http"):
             href = Config.VW_BASE_URL + href
 
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        title = ""
-        price = 0
-        mileage = 0
-        year = 0
+        # Extract structured data using targeted regex (not _extract_int on whole lines)
+        price = _extract_price(text)
+        mileage = _extract_mileage(text)
+        year = _extract_year(text)
+
         fuel_type = ""
         transmission = ""
-
-        for line in lines:
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
             line_lower = line.lower()
-            if "£" in line and not price:
-                # Extract first price (main price, not monthly)
-                price_match = re.search(r"£[\d,]+", line)
-                if price_match:
-                    candidate = _extract_int(price_match.group())
-                    if candidate > 500:  # Ignore monthly payment amounts
-                        price = candidate
-            if "mile" in line_lower and not mileage:
-                mileage = _extract_int(line)
-            if not year:
-                year = _extract_year(line)
-            if any(f in line_lower for f in ["petrol", "diesel", "electric", "hybrid"]):
-                fuel_type = line.strip()
-            if any(t in line_lower for t in ["manual", "automatic", "dsg", "single speed"]):
-                transmission = line.strip()
+            if not fuel_type and any(f in line_lower for f in ["petrol", "diesel", "electric", "hybrid"]):
+                fuel_type = line
+            if not transmission and any(t in line_lower for t in ["manual", "automatic", "dsg", "single speed"]):
+                transmission = line
 
-        # Title: use first meaningful line or detect from content
-        for line in lines:
-            if "volkswagen" in line.lower() or any(
-                m in line.lower() for m in ["golf", "polo", "tiguan", "t-roc", "id."]
-            ):
-                title = line.strip()
+        # Title: find a line mentioning VW or a model name
+        title = ""
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if "volkswagen" in line.lower() or _detect_model(line):
+                title = line
                 break
-        if not title and lines:
-            title = lines[0]
+        if not title:
+            # Use the first non-empty line
+            for line in text.split("\n"):
+                line = line.strip()
+                if line and not line.startswith("£"):
+                    title = line
+                    break
 
         model = _detect_model(title) or _detect_model(text)
 
