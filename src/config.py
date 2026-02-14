@@ -86,20 +86,7 @@ class Config:
 
     @classmethod
     def get_search_url(cls) -> str:
-        """Build the VW search URL, filtering by model if configured."""
-        model_filters = cls.get_model_filters()
-        if not model_filters:
-            return f"{cls.VW_BASE_URL}/en/vehicle_search/volkswagen/all-models"
-
-        # Build MODEL_TYPE_LST query params for server-side filtering
-        model_params = []
-        for name in model_filters:
-            slug = MODEL_SLUG_MAP.get(name)
-            if slug:
-                model_params.append(f"MODEL_TYPE_LST={slug}")
-
-        if model_params:
-            params = "&".join(model_params)
-            return f"{cls.VW_BASE_URL}/en/vehicle_search/volkswagen/all-models?{params}"
-
+        """Build the VW search URL."""
+        # Note: MODEL_TYPE_LST query params are only for the internal Solr API,
+        # not the page URL. Model filtering is done client-side after scraping.
         return f"{cls.VW_BASE_URL}/en/vehicle_search/volkswagen/all-models"

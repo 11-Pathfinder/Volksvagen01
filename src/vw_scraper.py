@@ -264,59 +264,159 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
 
 def _parse_listings_from_dom(page: Page) -> list[VWListing]:
     """Extract vehicle listings by running JavaScript in the browser to find car cards."""
+
+    # First, gather diagnostics about what's actually on the page
+    diagnostics = page.evaluate("""() => {
+        const allLinks = document.querySelectorAll('a[href]');
+        const hrefSamples = [];
+        const hrefPatterns = {};
+        for (const a of allLinks) {
+            const href = a.getAttribute('href') || '';
+            // Collect first 30 unique href samples
+            if (hrefSamples.length < 30 && href.length > 1) {
+                hrefSamples.push(href);
+            }
+            // Count href patterns
+            const parts = href.split('/').filter(Boolean);
+            const key = parts.length > 1 ? '/' + parts[0] + '/' + parts[1] : href.substring(0, 50);
+            hrefPatterns[key] = (hrefPatterns[key] || 0) + 1;
+        }
+        // Count elements with £ sign
+        const body = document.body.innerText || '';
+        const priceCount = (body.match(/£[\d,]+/g) || []).length;
+        const pageTextLen = body.length;
+
+        return {
+            totalLinks: allLinks.length,
+            hrefSamples,
+            hrefPatterns,
+            priceCount,
+            pageTextLen,
+            title: document.title,
+        };
+    }""")
+
+    logger.info(f"Page diagnostics: title='{diagnostics.get('title', '')}', "
+                f"links={diagnostics.get('totalLinks', 0)}, "
+                f"prices on page={diagnostics.get('priceCount', 0)}, "
+                f"page text length={diagnostics.get('pageTextLen', 0)}")
+    for pattern, count in sorted(diagnostics.get("hrefPatterns", {}).items(), key=lambda x: -x[1])[:15]:
+        logger.debug(f"  Link pattern: {pattern} ({count}x)")
+    for href in diagnostics.get("hrefSamples", [])[:10]:
+        logger.debug(f"  Sample href: {href}")
+
     raw_listings = page.evaluate("""() => {
         const results = [];
-        const processedHrefs = new Set();
+        const processedTexts = new Set();
 
+        // ── Strategy 1: Link-based ──
         // Find all links that point to individual vehicle detail pages.
-        // These URLs typically look like /en/vehicle/<id>/...
         const vehicleLinks = document.querySelectorAll(
-            'a[href*="/vehicle/"], a[href*="/car/"], a[href*="/detail/"]'
+            'a[href*="/vehicle/"], a[href*="/car/"], a[href*="/detail/"], '
+          + 'a[href*="/listing/"], a[href*="/used-car/"], a[href*="/approved/"]'
         );
 
         for (const link of vehicleLinks) {
             const href = link.getAttribute('href') || '';
-            // Skip non-detail links (e.g. /vehicle_search/ is the listing page, not a car)
             if (href.includes('vehicle_search') || href.includes('vehicle-search')) continue;
-            if (processedHrefs.has(href)) continue;
-            processedHrefs.add(href);
 
-            // Find the tightest containing card element.
-            // Walk up looking for the smallest ancestor that contains both
-            // a price (£) and some car info, but is NOT the whole page.
             let card = link;
             const maxTextLen = 3000;
             for (let i = 0; i < 6; i++) {
                 if (!card.parentElement) break;
                 const parent = card.parentElement;
                 const parentText = parent.innerText || '';
-                // Stop if the parent is too large (likely a page-level container)
                 if (parentText.length > maxTextLen) break;
                 card = parent;
             }
 
             const text = card.innerText || '';
-            // Skip if this is clearly a navigation/model-picker element
-            // (contains multiple "From £" entries which is the model list sidebar)
-            const fromPriceCount = (text.match(/From\s+£/gi) || []).length;
+            const fromPriceCount = (text.match(/From\\s+£/gi) || []).length;
             if (fromPriceCount > 2) continue;
-
-            // Must have a price to be a valid listing
             if (!text.includes('£')) continue;
-
-            // Skip very short text (probably just a link) or very long (page section)
             if (text.length < 30 || text.length > maxTextLen) continue;
+
+            // Dedup by text content (first 200 chars)
+            const textKey = text.substring(0, 200);
+            if (processedTexts.has(textKey)) continue;
+            processedTexts.add(textKey);
 
             const img = card.querySelector('img');
             const imgSrc = img ? (img.getAttribute('src') || img.getAttribute('data-src') || '') : '';
+            results.push({ text, href, imgSrc, strategy: 1 });
+        }
 
-            results.push({ text, href, imgSrc });
+        if (results.length > 0) return results;
+
+        // ── Strategy 2: Broad element search ──
+        // If link-based strategy found nothing, look for card-like elements
+        // that contain both a price (£) and car-related keywords.
+        const carKeywords = /\\b(volkswagen|vw|id\\.3|id\\.4|id\\.5|id\\.7|id\\. buzz|golf|polo|tiguan|t-roc|t-cross|touareg|touran|tayron|taigo|passat|arteon|up!|e-up|multivan)\\b/i;
+        const pricePattern = /£[\\d,]+/;
+
+        // Try common card/tile selectors first
+        const cardSelectors = [
+            '[class*="vehicle-card"]', '[class*="car-card"]', '[class*="listing-card"]',
+            '[class*="result-card"]', '[class*="product-card"]', '[class*="tile"]',
+            '[data-testid*="vehicle"]', '[data-testid*="listing"]', '[data-testid*="car"]',
+            'article', '[role="listitem"]',
+        ];
+
+        let candidateElements = [];
+        for (const sel of cardSelectors) {
+            const els = document.querySelectorAll(sel);
+            if (els.length > 0) {
+                candidateElements = Array.from(els);
+                break;
+            }
+        }
+
+        // If no card selectors matched, search all container elements
+        if (candidateElements.length === 0) {
+            candidateElements = Array.from(
+                document.querySelectorAll('div, section, li, article')
+            );
+        }
+
+        for (const el of candidateElements) {
+            const text = el.innerText || '';
+            if (text.length < 30 || text.length > 2000) continue;
+
+            // Must contain a price
+            if (!pricePattern.test(text)) continue;
+
+            // Must contain a car-related keyword
+            if (!carKeywords.test(text)) continue;
+
+            // Skip navigation/model-picker elements
+            const fromPriceCount = (text.match(/From\\s+£/gi) || []).length;
+            if (fromPriceCount > 2) continue;
+
+            // Skip if this contains multiple "miles" entries (likely a container of multiple cards)
+            const milesCount = (text.match(/\\bmiles\\b/gi) || []).length;
+            if (milesCount > 3) continue;
+
+            // Dedup by text content (first 200 chars)
+            const textKey = text.substring(0, 200);
+            if (processedTexts.has(textKey)) continue;
+            processedTexts.add(textKey);
+
+            // Try to find a link inside
+            const linkEl = el.querySelector('a[href]');
+            const href = linkEl ? (linkEl.getAttribute('href') || '') : '';
+
+            const img = el.querySelector('img');
+            const imgSrc = img ? (img.getAttribute('src') || img.getAttribute('data-src') || '') : '';
+
+            results.push({ text, href, imgSrc, strategy: 2 });
         }
 
         return results;
     }""")
 
-    logger.info(f"DOM extraction found {len(raw_listings)} potential vehicle cards")
+    strategies_used = set(r.get("strategy", 0) for r in raw_listings)
+    logger.info(f"DOM extraction found {len(raw_listings)} potential vehicle cards "
+                f"(strategies: {strategies_used})")
 
     listings = []
     for raw in raw_listings:
@@ -507,6 +607,25 @@ def scrape_vw_listings() -> list[VWListing]:
             # Step 4: If API didn't have vehicle data, extract from DOM
             if not all_listings:
                 logger.info("No vehicle data in API responses, extracting from rendered DOM...")
+
+                # Scroll down to trigger any lazy-loaded content
+                page.evaluate("""() => {
+                    return new Promise(resolve => {
+                        let totalHeight = 0;
+                        const distance = 500;
+                        const timer = setInterval(() => {
+                            window.scrollBy(0, distance);
+                            totalHeight += distance;
+                            if (totalHeight >= document.body.scrollHeight || totalHeight > 10000) {
+                                clearInterval(timer);
+                                window.scrollTo(0, 0);
+                                resolve();
+                            }
+                        }, 200);
+                    });
+                }""")
+                page.wait_for_timeout(2000)
+
                 all_listings = _parse_listings_from_dom(page)
                 logger.info(f"Extracted {len(all_listings)} listings from DOM")
 
