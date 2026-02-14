@@ -59,7 +59,7 @@ def _try_intercept_api(page: Page) -> list[dict] | None:
 
     page.on("response", handle_response)
     page.goto(Config.VW_SEARCH_URL, wait_until="networkidle", timeout=30000)
-    page.off("response", handle_response)
+    page.remove_listener("response", handle_response)
     return captured if captured else None
 
 
