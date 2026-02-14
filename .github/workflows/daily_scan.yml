@@ -1,0 +1,53 @@
+name: Daily VW Car Price Scan
+
+on:
+  schedule:
+    # Run daily at 7:00 AM UTC (8:00 AM BST)
+    - cron: '0 7 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run car price scanner
+        env:
+          VW_POSTCODE: ${{ secrets.VW_POSTCODE }}
+          VW_RADIUS_MILES: ${{ secrets.VW_RADIUS_MILES }}
+          VW_MAX_PRICE: ${{ secrets.VW_MAX_PRICE }}
+          VW_MAX_MILEAGE: ${{ secrets.VW_MAX_MILEAGE }}
+          VW_MIN_YEAR: ${{ secrets.VW_MIN_YEAR }}
+          VW_MODELS: ${{ secrets.VW_MODELS }}
+          AT_POSTCODE: ${{ secrets.AT_POSTCODE }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python main.py --save-html report.html
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report-${{ github.run_number }}
+          path: report.html
+          retention-days: 30
