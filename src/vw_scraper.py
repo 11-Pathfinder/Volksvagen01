@@ -91,7 +91,7 @@ def _detect_model(text: str) -> str:
     return ""
 
 
-def _try_intercept_api(page: Page) -> list[dict]:
+def _try_intercept_api(page: Page, url: str) -> list[dict]:
     """Capture ALL JSON responses during page load."""
     captured = []
 
@@ -105,9 +105,8 @@ def _try_intercept_api(page: Page) -> list[dict]:
             pass
 
     page.on("response", handle_response)
-    search_url = Config.get_search_url()
-    logger.info(f"Navigating to: {search_url}")
-    page.goto(search_url, wait_until="networkidle", timeout=45000)
+    logger.info(f"Navigating to: {url}")
+    page.goto(url, wait_until="networkidle", timeout=45000)
     page.remove_listener("response", handle_response)
     return captured
 
@@ -566,10 +565,149 @@ def _save_debug(api_responses: list[dict], page: Page | None) -> None:
         logger.debug(f"Failed to save debug data: {e}")
 
 
+def _scroll_for_lazy_content(page: Page) -> None:
+    """Scroll the page to trigger lazy-loaded content, then scroll back to top."""
+    page.evaluate("""() => {
+        return new Promise(resolve => {
+            let totalHeight = 0;
+            const distance = 500;
+            const timer = setInterval(() => {
+                window.scrollBy(0, distance);
+                totalHeight += distance;
+                if (totalHeight >= document.body.scrollHeight || totalHeight > 15000) {
+                    clearInterval(timer);
+                    window.scrollTo(0, 0);
+                    resolve();
+                }
+            }, 200);
+        });
+    }""")
+    page.wait_for_timeout(2000)
+
+
+def _try_load_more(page: Page) -> bool:
+    """Try to click 'Load More' / 'Show More' buttons or paginate. Returns True if more loaded."""
+    # Try "Load More" / "Show More" buttons (common on modern sites)
+    load_more_selectors = [
+        "button:has-text('Load more')",
+        "button:has-text('Show more')",
+        "button:has-text('load more')",
+        "button:has-text('show more')",
+        "a:has-text('Load more')",
+        "a:has-text('Show more')",
+        "[class*='load-more']",
+        "[class*='show-more']",
+        "[data-testid*='load-more']",
+    ]
+    for sel in load_more_selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                logger.info(f"Found 'load more' button: {sel}")
+                btn.click()
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            continue
+
+    # Try pagination "Next" buttons
+    next_selectors = [
+        "a[aria-label='Next']",
+        "button[aria-label='Next']",
+        "a:has-text('Next')",
+        "button:has-text('Next')",
+        "[class*='pagination'] a:last-child",
+        "a[rel='next']",
+        "button:has-text('>')",
+        "[class*='next-page']",
+        "a[class*='next']",
+    ]
+    for sel in next_selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                logger.info(f"Found 'next' button: {sel}")
+                btn.click()
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _scrape_single_url(page: Page, url: str, cookie_handled: bool) -> tuple[list[VWListing], list[dict], bool]:
+    """Scrape a single URL and return (listings, api_responses, cookie_handled)."""
+    # Step 1: Load page and intercept JSON responses
+    api_responses = _try_intercept_api(page, url)
+    logger.info(f"Intercepted {len(api_responses)} JSON responses")
+    for resp in api_responses:
+        resp_url = resp.get("url", "")
+        logger.info(f"  API: {resp_url[:120]}")
+
+    # Step 2: Try to parse vehicle data from API responses
+    listings = _parse_listings_from_api(api_responses)
+    if listings:
+        logger.info(f"Parsed {len(listings)} listings from API data")
+
+    # Step 3: Handle cookie consent (only on first URL)
+    if not cookie_handled:
+        _handle_cookie_consent(page)
+        _handle_postcode_entry(page)
+        cookie_handled = True
+    page.wait_for_timeout(3000)
+
+    # Step 4: If API didn't have vehicle data, extract from DOM
+    if not listings:
+        logger.info("No vehicle data in API responses, extracting from rendered DOM...")
+        _scroll_for_lazy_content(page)
+        listings = _parse_listings_from_dom(page)
+        logger.info(f"Extracted {len(listings)} listings from DOM (page 1)")
+
+    # Step 5: Try to load more results (pagination / infinite scroll / load-more)
+    if listings:
+        for page_num in range(2, Config.VW_MAX_PAGES + 1):
+            prev_count = len(listings)
+
+            if not _try_load_more(page):
+                logger.info(f"No more pages/load-more buttons found after page {page_num - 1}")
+                break
+
+            _scroll_for_lazy_content(page)
+            page_listings = _parse_listings_from_dom(page)
+
+            if not page_listings:
+                logger.info(f"Page {page_num}: no new listings found, stopping")
+                break
+
+            # Deduplicate against existing listings
+            existing_texts = {l.title[:50] for l in listings}
+            new_listings = [l for l in page_listings if l.title[:50] not in existing_texts]
+
+            if not new_listings:
+                logger.info(f"Page {page_num}: all listings are duplicates, stopping")
+                break
+
+            listings.extend(new_listings)
+            logger.info(f"Page {page_num}: +{len(new_listings)} new listings (total: {len(listings)})")
+
+    return listings, api_responses, cookie_handled
+
+
 def scrape_vw_listings() -> list[VWListing]:
     """Main entry point: scrape VW used car listings and return structured data."""
     logger.info("Starting VW used car scraper")
+
+    # Log active filters
+    model_filters = Config.get_model_filters()
+    search_urls = Config.get_search_urls()
+    logger.info(f"Model filters: {model_filters or 'none (all models)'}")
+    logger.info(f"Search URLs to try: {search_urls}")
+
     all_listings: list[VWListing] = []
+    all_api_responses: list[dict] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -582,105 +720,56 @@ def scrape_vw_listings() -> list[VWListing]:
             viewport={"width": 1920, "height": 1080},
         )
         page = context.new_page()
+        cookie_handled = False
 
         try:
-            # Step 1: Load page and intercept ALL JSON responses
-            logger.info("Loading search page and intercepting API calls...")
-            api_responses = _try_intercept_api(page)
-            logger.info(f"Intercepted {len(api_responses)} JSON responses")
+            for url in search_urls:
+                # If we already have listings from a model-specific URL,
+                # skip the all-models fallback
+                if all_listings and "all-models" in url:
+                    logger.info(f"Skipping all-models URL (already have {len(all_listings)} listings)")
+                    break
 
-            # Log what we captured
-            for resp in api_responses:
-                url = resp.get("url", "")
-                logger.info(f"  API: {url[:120]}")
+                logger.info(f"--- Scraping: {url} ---")
+                listings, api_responses, cookie_handled = _scrape_single_url(
+                    page, url, cookie_handled
+                )
+                all_listings.extend(listings)
+                all_api_responses.extend(api_responses)
+                logger.info(f"Got {len(listings)} listings from {url}")
 
-            # Step 2: Try to parse vehicle data from API responses
-            all_listings = _parse_listings_from_api(api_responses)
-            if all_listings:
-                logger.info(f"Parsed {len(all_listings)} listings from API data")
-
-            # Step 3: Handle cookie consent and postcode
-            _handle_cookie_consent(page)
-            _handle_postcode_entry(page)
-            page.wait_for_timeout(3000)
-
-            # Step 4: If API didn't have vehicle data, extract from DOM
-            if not all_listings:
-                logger.info("No vehicle data in API responses, extracting from rendered DOM...")
-
-                # Scroll down to trigger any lazy-loaded content
-                page.evaluate("""() => {
-                    return new Promise(resolve => {
-                        let totalHeight = 0;
-                        const distance = 500;
-                        const timer = setInterval(() => {
-                            window.scrollBy(0, distance);
-                            totalHeight += distance;
-                            if (totalHeight >= document.body.scrollHeight || totalHeight > 10000) {
-                                clearInterval(timer);
-                                window.scrollTo(0, 0);
-                                resolve();
-                            }
-                        }, 200);
-                    });
-                }""")
-                page.wait_for_timeout(2000)
-
-                all_listings = _parse_listings_from_dom(page)
-                logger.info(f"Extracted {len(all_listings)} listings from DOM")
-
-            # Step 5: Handle pagination
-            if all_listings:
-                for page_num in range(2, Config.VW_MAX_PAGES + 1):
-                    next_selectors = [
-                        "a[aria-label='Next']",
-                        "button[aria-label='Next']",
-                        "a:has-text('Next')",
-                        "button:has-text('Next')",
-                        "[class*='pagination'] a:last-child",
-                        "a[rel='next']",
-                        "button:has-text('>')",
-                    ]
-                    clicked = False
-                    for sel in next_selectors:
-                        try:
-                            btn = page.query_selector(sel)
-                            if btn and btn.is_visible():
-                                btn.click()
-                                page.wait_for_load_state("networkidle", timeout=15000)
-                                page.wait_for_timeout(2000)
-                                clicked = True
-                                break
-                        except Exception:
-                            continue
-
-                    if not clicked:
-                        logger.info(f"No more pages after page {page_num - 1}")
-                        break
-
-                    page_listings = _parse_listings_from_dom(page)
-                    if not page_listings:
-                        break
-                    all_listings.extend(page_listings)
-                    logger.info(f"Page {page_num}: {len(page_listings)} listings (total: {len(all_listings)})")
-
-            # Save debug artifacts
-            _save_debug(api_responses, page)
+            # Save debug artifacts from last page visited
+            _save_debug(all_api_responses, page)
 
         except PlaywrightTimeout:
             logger.error("Timeout loading VW used cars page")
+            _save_debug(all_api_responses, page)
         except Exception as e:
-            logger.error(f"Error scraping VW listings: {e}")
+            logger.error(f"Error scraping VW listings: {e}", exc_info=True)
+            _save_debug(all_api_responses, page)
         finally:
             browser.close()
 
-    # Apply filters
-    model_filters = Config.get_model_filters()
+    logger.info(f"Total raw listings before filtering: {len(all_listings)}")
+
+    # Log model distribution before filtering
+    model_counts: dict[str, int] = {}
+    for l in all_listings:
+        m = l.model or "(unknown)"
+        model_counts[m] = model_counts.get(m, 0) + 1
+    logger.info(f"Models found: {model_counts}")
+
+    # Apply model filter (safety net - model-specific URLs should already filter)
     if model_filters:
+        before = len(all_listings)
         all_listings = [
             l for l in all_listings
-            if l.model.lower() in model_filters or any(m in l.title.lower() for m in model_filters)
+            if l.model.lower() in model_filters
+            or any(m in l.title.lower() for m in model_filters)
+            or any(m in l.model.lower() for m in model_filters)
         ]
+        logger.info(f"Model filter: {before} → {len(all_listings)} listings "
+                     f"(kept models matching {model_filters})")
 
     if Config.VW_MAX_PRICE:
         max_price = int(Config.VW_MAX_PRICE)
@@ -705,5 +794,5 @@ def scrape_vw_listings() -> list[VWListing]:
             unique.append(l)
     all_listings = unique
 
-    logger.info(f"Scraping complete: {len(all_listings)} listings after filtering")
+    logger.info(f"Scraping complete: {len(all_listings)} listings after filtering and dedup")
     return all_listings
