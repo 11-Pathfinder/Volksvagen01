@@ -95,6 +95,9 @@ def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
     """Capture ALL JSON responses and a full network log during page load.
 
     Returns (json_responses, network_log).
+    Uses a two-phase approach: first load with domcontentloaded (fast),
+    then wait for networkidle with a shorter timeout (best-effort).
+    Retries once on timeout.
     """
     json_responses: list[dict] = []
     network_log: list[dict] = []
@@ -122,8 +125,32 @@ def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
             pass
 
     page.on("response", handle_response)
-    logger.info(f"Navigating to: {url}")
-    page.goto(url, wait_until="networkidle", timeout=45000)
+
+    # Try up to 2 attempts with increasing timeout
+    last_error = None
+    for attempt in range(2):
+        try:
+            timeout = 45000 if attempt == 0 else 60000
+            logger.info(f"Navigating to: {url} (attempt {attempt + 1})")
+            # Phase 1: Wait for DOM to be ready (more reliable than networkidle)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            # Phase 2: Best-effort wait for network to settle
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeout:
+                logger.warning("networkidle wait timed out — continuing with partially loaded page")
+            last_error = None
+            break
+        except PlaywrightTimeout as e:
+            last_error = e
+            if attempt == 0:
+                logger.warning(f"Page load timed out, retrying... ({e})")
+                page.wait_for_timeout(2000)
+
+    if last_error:
+        logger.error(f"Page load failed after retries: {last_error}")
+        page.remove_listener("response", handle_response)
+        raise last_error
 
     # Check for redirect
     final_url = page.url
@@ -288,7 +315,7 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
     """Extract vehicle listings by running JavaScript in the browser to find car cards."""
 
     # First, gather diagnostics about what's actually on the page
-    diagnostics = page.evaluate("""() => {
+    diagnostics = page.evaluate(r"""() => {
         const allLinks = document.querySelectorAll('a[href]');
         const hrefSamples = [];
         const hrefPatterns = {};
@@ -637,7 +664,7 @@ def _save_debug_for_url(
             (url_dir / "page_source.html").write_text(html)
 
             # 5. Comprehensive DOM analysis
-            dom_analysis = page.evaluate("""() => {
+            dom_analysis = page.evaluate(r"""() => {
                 const result = {};
 
                 // Basic page info
@@ -969,7 +996,7 @@ def scrape_vw_listings() -> list[VWListing]:
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/131.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1920, "height": 1080},
         )
@@ -985,17 +1012,23 @@ def scrape_vw_listings() -> list[VWListing]:
                     break
 
                 logger.info(f"--- Scraping: {url} ---")
-                listings, api_responses, cookie_handled = _scrape_single_url(
-                    page, url, cookie_handled
-                )
-                all_listings.extend(listings)
-                all_api_responses.extend(api_responses)
-                logger.info(f"Got {len(listings)} listings from {url}")
+                try:
+                    listings, api_responses, cookie_handled = _scrape_single_url(
+                        page, url, cookie_handled
+                    )
+                    all_listings.extend(listings)
+                    all_api_responses.extend(api_responses)
+                    logger.info(f"Got {len(listings)} listings from {url}")
+                except PlaywrightTimeout:
+                    logger.error(f"Timeout loading {url} — skipping to next URL")
+                    # Save debug artifacts even on timeout
+                    _save_debug_for_url(url, [], [], [], page)
+                except Exception as e:
+                    logger.error(f"Error scraping {url}: {e}", exc_info=True)
+                    _save_debug_for_url(url, [], [], [], page)
 
-        except PlaywrightTimeout:
-            logger.error("Timeout loading VW used cars page")
         except Exception as e:
-            logger.error(f"Error scraping VW listings: {e}", exc_info=True)
+            logger.error(f"Fatal error in scraper: {e}", exc_info=True)
         finally:
             browser.close()
 

@@ -27,6 +27,9 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
+      - name: Create debug directory
+        run: mkdir -p debug
+
       - name: Run car price scanner
         env:
           VW_POSTCODE: ${{ secrets.VW_POSTCODE }}
