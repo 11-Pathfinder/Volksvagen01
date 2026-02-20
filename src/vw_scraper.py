@@ -73,6 +73,17 @@ def _extract_price(text: str) -> int:
             if after.startswith("mile"):
                 continue
             return val
+    # Last resort: plain 5-6 digit numbers without commas (e.g. "18995")
+    for m in re.finditer(r"\b([1-9]\d{4,5})\b", text):
+        val = int(m.group(1))
+        if 2000 < val < 200000:
+            after = text[m.end():m.end() + 10].strip().lower()
+            if after.startswith("mile"):
+                continue
+            before = text[max(0, m.start() - 15):m.start()].lower()
+            if "mile" in before or "km" in before:
+                continue
+            return val
     return 0
 
 
@@ -190,10 +201,6 @@ def _parse_listings_from_api(api_responses: list[dict]) -> list[VWListing]:
         url = resp.get("url", "")
         data = resp.get("data")
 
-        # Skip the solr-response.json facet endpoint - it only has filter metadata
-        if "solr-response" in url:
-            continue
-
         # Recursively search for arrays of objects that look like vehicle listings
         candidates = _find_vehicle_arrays(data)
         for vehicles in candidates:
@@ -281,6 +288,19 @@ def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> lis
                         priceStr = priceEl.getAttribute('data-price')
                                || priceEl.textContent.replace(/[^\d,]/g, '')
                                || '';
+                    }
+                }
+
+                // Broader fallback: any element with "price" in class, extract numeric text
+                // (DOMParser won't apply CSS ::before{content:"£"}, so we get raw numbers)
+                if (!priceStr) {
+                    const priceEls = card.querySelectorAll('[class*="price"]');
+                    for (const pe of priceEls) {
+                        const t = (pe.textContent || '').replace(/[^\d,]/g, '');
+                        if (/^\d[\d,]{3,6}$/.test(t)) {
+                            priceStr = t.replace(/,/g, '');
+                            break;
+                        }
                     }
                 }
 
@@ -420,12 +440,16 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
         return None
 
     # Try various key patterns for price
+    # Solr may return numbers as floats (e.g. 8495.0) — handle that safely
     price = 0
     for k in ["price", "Price", "PRICE", "retailPrice", "cashPrice",
               "PRICE_RETAIL_CUR", "PRICE_B2B_CUR", "salePrice"]:
         val = v.get(k)
         if val is not None:
-            price = _extract_int(str(val))
+            if isinstance(val, (int, float)):
+                price = int(round(val))
+            else:
+                price = _extract_int(str(val))
             if price > 0:
                 break
 
@@ -433,7 +457,8 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
         return None
 
     title = ""
-    for k in ["title", "name", "headline", "TITLE", "displayName", "vehicleTitle"]:
+    for k in ["title", "name", "headline", "TITLE", "displayName", "vehicleTitle",
+              "HEADLINE_STR"]:
         if v.get(k):
             title = str(v[k])
             break
@@ -442,7 +467,10 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
     for k in ["mileage", "MILEAGE", "odometer", "MILEAGE_MIL_INT", "miles"]:
         val = v.get(k)
         if val is not None:
-            mileage = _extract_int(str(val))
+            if isinstance(val, (int, float)):
+                mileage = int(round(val))
+            else:
+                mileage = _extract_int(str(val))
             if mileage > 0:
                 break
 
@@ -450,10 +478,14 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
     for k in ["year", "modelYear", "registrationYear", "INITIAL_REGISTRATION_DTE"]:
         val = v.get(k)
         if val is not None:
-            year = _extract_int(str(val))
-            if 2000 <= year <= 2030:
+            if isinstance(val, (int, float)):
+                yr = int(round(val))
+            else:
+                # INITIAL_REGISTRATION_DTE is a date like "2020-01-15T00:00:00Z"
+                yr = _extract_year(str(val))
+            if 2000 <= yr <= 2030:
+                year = yr
                 break
-            year = 0
 
     fuel = ""
     for k in ["fuelType", "fuel", "FUEL_TYPE_LST"]:
@@ -487,24 +519,36 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
         dealer_name = dealer.get("name", "")
     elif isinstance(dealer, str):
         dealer_name = dealer
-    for k in ["dealerName", "DEALER"]:
+    for k in ["dealerName", "DEALER", "DEALER_NAME_STR"]:
         if not dealer_name and v.get(k):
             dealer_name = str(v[k])
 
+    location = ""
+    for k in ["location", "dealerLocation", "DEALER_CITY_STR", "CITY_STR"]:
+        if v.get(k):
+            location = str(v[k])
+            break
+
     url = ""
-    for k in ["url", "detailUrl", "link", "href"]:
+    for k in ["url", "detailUrl", "link", "href", "DETAIL_URL_STR"]:
         if v.get(k):
             url = str(v[k])
             break
 
     img = ""
-    for k in ["imageUrl", "image", "mainImage", "thumbnailUrl"]:
+    for k in ["imageUrl", "image", "mainImage", "thumbnailUrl", "IMAGE_URL_STR"]:
         if v.get(k):
             img = str(v[k])
             break
 
+    registration = ""
+    for k in ["registration", "vrm", "CHIFFRE_STR"]:
+        if v.get(k):
+            registration = str(v[k])
+            break
+
     return VWListing(
-        title=title,
+        title=title or model or trim,
         price=price,
         mileage=mileage,
         year=year,
@@ -512,9 +556,9 @@ def _try_parse_vehicle_dict(v: dict) -> VWListing | None:
         transmission=transmission,
         model=model,
         trim=trim,
-        registration=v.get("registration", v.get("vrm", "")),
+        registration=registration,
         dealer=dealer_name,
-        location=v.get("location", v.get("dealerLocation", "")),
+        location=location,
         url=url,
         image_url=img,
     )
@@ -615,6 +659,17 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
             if (!priceStr) {
                 const pe = card.querySelector('[data-price], [class*="price"] [class*="amount"]');
                 if (pe) priceStr = pe.getAttribute('data-price') || pe.textContent.replace(/[^\d,]/g, '') || '';
+            }
+            // Broader fallback: any element with "price" in class name
+            if (!priceStr) {
+                const priceEls = card.querySelectorAll('[class*="price"]');
+                for (const pe of priceEls) {
+                    const t = (pe.innerText || pe.textContent || '').replace(/[^\d,]/g, '');
+                    if (/^\d[\d,]{3,6}$/.test(t)) {
+                        priceStr = t.replace(/,/g, '');
+                        break;
+                    }
+                }
             }
 
             const img = card.querySelector('img');
@@ -1205,16 +1260,16 @@ def _scrape_single_url(page: Page, url: str, cookie_handled: bool) -> tuple[list
     final_url = page.url
     logger.info(f"Final page URL: {final_url}")
 
-    # Step 2a: Try to parse vehicle data from XHR HTML (primary method for VW site)
-    listings = []
-    if xhr_html_bodies:
-        listings = _parse_listings_from_xhr_html(page, xhr_html_bodies)
-
-    # Step 2b: Try API JSON responses as fallback
-    if not listings:
-        listings = _parse_listings_from_api(api_responses)
+    # Step 2a: Try API JSON first (Solr response has structured data with prices)
+    listings = _parse_listings_from_api(api_responses)
     if listings:
-        logger.info(f"Parsed {len(listings)} listings from intercepted data")
+        logger.info(f"Parsed {len(listings)} listings from API JSON (Solr)")
+
+    # Step 2b: Try XHR HTML as fallback (prices may be CSS-rendered, less reliable)
+    if not listings and xhr_html_bodies:
+        listings = _parse_listings_from_xhr_html(page, xhr_html_bodies)
+        if listings:
+            logger.info(f"Parsed {len(listings)} listings from XHR HTML")
 
     # Step 3: Handle cookie consent (only on first URL)
     if not cookie_handled:
