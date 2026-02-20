@@ -56,11 +56,22 @@ def _extract_mileage(text: str) -> int:
 
 def _extract_price(text: str) -> int:
     """Extract the main GBP price from text (ignoring monthly payments)."""
-    # Find all £ prices
-    prices = re.findall(r"£([\d,]+)", text)
+    # Find all £ prices (standard format, including HTML entity &pound;)
+    prices = re.findall(r"(?:£|&pound;|&#163;)([\d,]+)", text)
     for p in prices:
         val = _extract_int(p)
         if val > 500:  # Skip monthly payment amounts
+            return val
+    # Fallback: look for large standalone numbers that could be prices
+    # (VW site sometimes renders £ via CSS, so textContent misses it)
+    # Exclude numbers followed by "miles"
+    for m in re.finditer(r"\b(\d{1,3}(?:,\d{3})+)\b", text):
+        val = _extract_int(m.group(1))
+        if 2000 < val < 200000:
+            # Skip if immediately followed by "miles" (this is mileage, not price)
+            after = text[m.end():m.end() + 10].strip().lower()
+            if after.startswith("mile"):
+                continue
             return val
     return 0
 
@@ -225,11 +236,10 @@ def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> lis
                 // Search/filter pages have 4:
                 //   en / vehicle_search / volkswagen / model
                 if (segments.length < 5) continue;
-
-                // Skip pagination links (page1, page2, ...)
                 if (/^page\d+$/.test(segments[segments.length - 1])) continue;
+                // Skip finance section links
+                if (href.includes('#vdpSection')) continue;
 
-                // Deduplicate by path
                 if (processedHrefs.has(path)) continue;
                 processedHrefs.add(path);
 
@@ -238,23 +248,66 @@ def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> lis
                 for (let i = 0; i < 8; i++) {
                     if (!card.parentElement) break;
                     const parent = card.parentElement;
-                    const parentText = parent.textContent || '';
-                    if (parentText.length > 4000) break;
+                    if ((parent.textContent || '').length > 5000) break;
                     card = parent;
                 }
 
-                // Use textContent (not innerText — works on parsed docs and
-                // includes text from CSS-hidden elements like prices)
+                // textContent from DOMParser won't have £ if it's CSS-rendered,
+                // won't have linebreaks either. Get the raw innerHTML and extract
+                // ALL text from child elements separately.
                 const text = card.textContent || '';
-                if (text.length < 20) continue;
+                if (text.length < 15) continue;
 
+                // Also get innerHTML for regex-based price extraction
+                const innerHTML = card.innerHTML || '';
+
+                // Try to find price from:
+                // 1. Literal £ in text/HTML
+                // 2. data-price or data-* attributes
+                // 3. Elements with price-related classes
+                let priceStr = '';
+
+                // Check innerHTML for £ (may be HTML entity)
+                const priceMatch = innerHTML.match(/(?:£|&pound;|&#163;)([\d,]+)/);
+                if (priceMatch) priceStr = priceMatch[1];
+
+                // Check data attributes on the card and its children
+                if (!priceStr) {
+                    const priceEl = card.querySelector(
+                        '[data-price], [class*="price"] [class*="amount"], [class*="price-value"]'
+                    );
+                    if (priceEl) {
+                        priceStr = priceEl.getAttribute('data-price')
+                               || priceEl.textContent.replace(/[^\d,]/g, '')
+                               || '';
+                    }
+                }
+
+                // Check all data attributes for price patterns
+                if (!priceStr) {
+                    const allEls = card.querySelectorAll('[data-price], [data-retail-price], [data-cash-price]');
+                    for (const el of allEls) {
+                        for (const attr of el.attributes) {
+                            if (/price/i.test(attr.name)) {
+                                const v = attr.value.replace(/[^\d]/g, '');
+                                if (v.length >= 4) { priceStr = v; break; }
+                            }
+                        }
+                        if (priceStr) break;
+                    }
+                }
+
+                // Find image
                 const img = card.querySelector('img');
                 const imgSrc = img
                     ? (img.getAttribute('src') || img.getAttribute('data-src')
                        || img.getAttribute('data-lazy') || '')
                     : '';
 
-                results.push({ text, href: path, imgSrc });
+                // Extract model from the path: .../volkswagen/{model}/{detail}
+                const pathModel = segments.length >= 4 ? segments[3] : '';
+
+                results.push({ text, innerHTML, href: path, imgSrc, priceStr, pathModel });
             }
 
             return results;
@@ -264,44 +317,59 @@ def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> lis
 
         for raw in raw_listings:
             text = raw.get("text", "")
+            inner_html = raw.get("innerHTML", "")
             href = raw.get("href", "")
             img_src = raw.get("imgSrc", "")
+            js_price_str = raw.get("priceStr", "")
+            path_model = raw.get("pathModel", "")
 
             if href and not href.startswith("http"):
                 href = Config.VW_BASE_URL + href
 
-            price = _extract_price(text)
-            mileage = _extract_mileage(text)
-            year = _extract_year(text)
+            # Price: try JS-extracted first, then regex on text, then regex on HTML
+            price = 0
+            if js_price_str:
+                price = _extract_int(js_price_str)
+            if price == 0:
+                price = _extract_price(text)
+            if price == 0:
+                price = _extract_price(inner_html)
 
+            mileage = _extract_mileage(text)
+            if mileage == 0:
+                mileage = _extract_mileage(inner_html)
+            year = _extract_year(text)
+            if year == 0:
+                year = _extract_year(inner_html)
+
+            # textContent from DOMParser has no linebreaks — search full text
+            text_lower = text.lower()
             fuel_type = ""
+            for f in ["petrol", "diesel", "electric", "hybrid", "plug-in hybrid"]:
+                if f in text_lower:
+                    fuel_type = f.title()
+                    break
+
             transmission = ""
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                line_lower = line.lower()
-                if not fuel_type and any(f in line_lower for f in ["petrol", "diesel", "electric", "hybrid"]):
-                    fuel_type = line
-                if not transmission and any(t in line_lower for t in ["manual", "automatic", "dsg", "single speed"]):
-                    transmission = line
+            for t in ["manual", "automatic", "dsg", "single speed", "auto"]:
+                if t in text_lower:
+                    transmission = t.title()
+                    break
+
+            # Title: try to find VW model name in text; fallback to path-based model
+            model = _detect_model(text)
+            if not model and path_model:
+                model = _detect_model(path_model.replace("-", " "))
 
             title = ""
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                if "volkswagen" in line.lower() or _detect_model(line):
-                    title = line
-                    break
+            # Try extracting title from innerHTML (look for heading elements)
+            heading_match = re.search(
+                r"<h[1-4][^>]*>(.*?)</h[1-4]>", inner_html, re.IGNORECASE | re.DOTALL
+            )
+            if heading_match:
+                title = re.sub(r"<[^>]+>", "", heading_match.group(1)).strip()
             if not title:
-                for line in text.split("\n"):
-                    line = line.strip()
-                    if line and len(line) > 5:
-                        title = line
-                        break
-
-            model = _detect_model(title) or _detect_model(text)
+                title = model or path_model.replace("-", " ").title()
 
             if price > 500:
                 all_listings.append(VWListing(
@@ -529,20 +597,32 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
             for (let i = 0; i < 8; i++) {
                 if (!card.parentElement) break;
                 const parent = card.parentElement;
-                if ((parent.textContent || '').length > 4000) break;
+                if ((parent.textContent || '').length > 5000) break;
                 card = parent;
             }
 
-            // Use textContent (works even when prices are CSS-rendered)
-            const text = card.textContent || '';
-            if (text.length < 20) continue;
+            // On live page, try innerText first (respects CSS rendering),
+            // fall back to textContent for hidden prices
+            const text = card.innerText || card.textContent || '';
+            const innerHTML = card.innerHTML || '';
+            if (text.length < 15) continue;
+
+            // Extract price from innerHTML (catches £ in HTML entities)
+            let priceStr = '';
+            const pm = innerHTML.match(/(?:£|&pound;|&#163;)([\d,]+)/);
+            if (pm) priceStr = pm[1];
+            if (!priceStr) {
+                const pe = card.querySelector('[data-price], [class*="price"] [class*="amount"]');
+                if (pe) priceStr = pe.getAttribute('data-price') || pe.textContent.replace(/[^\d,]/g, '') || '';
+            }
 
             const img = card.querySelector('img');
             const imgSrc = img
                 ? (img.getAttribute('src') || img.getAttribute('data-src')
                    || img.getAttribute('data-lazy') || '')
                 : '';
-            results.push({ text, href: path, imgSrc, strategy: 0 });
+            const pathModel = segments.length >= 4 ? segments[3] : '';
+            results.push({ text, innerHTML, href: path, imgSrc, priceStr, pathModel, strategy: 0 });
         }
 
         if (results.length > 0) return results;
@@ -650,47 +730,74 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
     listings = []
     for raw in raw_listings:
         text = raw.get("text", "")
+        inner_html = raw.get("innerHTML", "")
         href = raw.get("href", "")
         img_src = raw.get("imgSrc", "")
+        js_price_str = raw.get("priceStr", "")
+        path_model = raw.get("pathModel", "")
+        strategy = raw.get("strategy", -1)
 
         if href and not href.startswith("http"):
             href = Config.VW_BASE_URL + href
 
-        # Extract structured data using targeted regex (not _extract_int on whole lines)
-        price = _extract_price(text)
+        # Price: try JS-extracted from HTML first, then regex
+        price = 0
+        if js_price_str:
+            price = _extract_int(js_price_str)
+        if price == 0:
+            price = _extract_price(text)
+        if price == 0 and inner_html:
+            price = _extract_price(inner_html)
+
         mileage = _extract_mileage(text)
+        if mileage == 0 and inner_html:
+            mileage = _extract_mileage(inner_html)
         year = _extract_year(text)
+        if year == 0 and inner_html:
+            year = _extract_year(inner_html)
 
+        # Fuel/transmission: search text (with or without linebreaks)
+        text_lower = text.lower()
         fuel_type = ""
-        transmission = ""
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            line_lower = line.lower()
-            if not fuel_type and any(f in line_lower for f in ["petrol", "diesel", "electric", "hybrid"]):
-                fuel_type = line
-            if not transmission and any(t in line_lower for t in ["manual", "automatic", "dsg", "single speed"]):
-                transmission = line
-
-        # Title: find a line mentioning VW or a model name
-        title = ""
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if "volkswagen" in line.lower() or _detect_model(line):
-                title = line
+        for f in ["petrol", "diesel", "electric", "hybrid", "plug-in hybrid"]:
+            if f in text_lower:
+                fuel_type = f.title()
                 break
+
+        transmission = ""
+        for t in ["manual", "automatic", "dsg", "single speed"]:
+            if t in text_lower:
+                transmission = t.title()
+                break
+
+        # Title: try heading from innerHTML, then text lines, then path
+        title = ""
+        if inner_html:
+            heading_match = re.search(
+                r"<h[1-4][^>]*>(.*?)</h[1-4]>", inner_html, re.IGNORECASE | re.DOTALL
+            )
+            if heading_match:
+                title = re.sub(r"<[^>]+>", "", heading_match.group(1)).strip()
         if not title:
-            # Use the first non-empty line
             for line in text.split("\n"):
                 line = line.strip()
-                if line and not line.startswith("£"):
+                if not line:
+                    continue
+                if "volkswagen" in line.lower() or _detect_model(line):
+                    title = line
+                    break
+        if not title:
+            for line in text.split("\n"):
+                line = line.strip()
+                if line and len(line) > 5 and not line.startswith("£"):
                     title = line
                     break
 
         model = _detect_model(title) or _detect_model(text)
+        if not model and path_model:
+            model = _detect_model(path_model.replace("-", " "))
+        if not title:
+            title = model or (path_model.replace("-", " ").title() if path_model else "")
 
         if price > 500:
             listings.append(VWListing(
