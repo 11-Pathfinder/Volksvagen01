@@ -91,15 +91,16 @@ def _detect_model(text: str) -> str:
     return ""
 
 
-def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
-    """Capture ALL JSON responses and a full network log during page load.
+def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[str], list[dict]]:
+    """Capture JSON responses, XHR HTML, and a full network log during page load.
 
-    Returns (json_responses, network_log).
+    Returns (json_responses, xhr_html_bodies, network_log).
     Uses a two-phase approach: first load with domcontentloaded (fast),
     then wait for networkidle with a shorter timeout (best-effort).
     Retries once on timeout.
     """
     json_responses: list[dict] = []
+    xhr_html_bodies: list[str] = []
     network_log: list[dict] = []
 
     def handle_response(response):
@@ -121,6 +122,14 @@ def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
             if "application/json" in content_type:
                 data = response.json()
                 json_responses.append({"url": resp_url, "data": data})
+
+            # Capture XHR HTML from the results endpoint (VW loads listings via AJAX)
+            if "xhr-results" in resp_url and "text/html" in content_type and status == 200:
+                try:
+                    xhr_html_bodies.append(response.text())
+                    logger.info(f"Captured XHR HTML from {resp_url[:100]} ({entry.get('size', '?')} bytes)")
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -150,7 +159,7 @@ def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
     if last_error:
         logger.error(f"Page load failed after retries: {last_error}")
         page.remove_listener("response", handle_response)
-        raise last_error
+        raise last_error  # noqa: will be caught by _scrape_single_url caller
 
     # Check for redirect
     final_url = page.url
@@ -158,7 +167,7 @@ def _try_intercept_api(page: Page, url: str) -> tuple[list[dict], list[dict]]:
         logger.warning(f"URL redirected: {url} → {final_url}")
 
     page.remove_listener("response", handle_response)
-    return json_responses, network_log
+    return json_responses, xhr_html_bodies, network_log
 
 
 def _parse_listings_from_api(api_responses: list[dict]) -> list[VWListing]:
@@ -182,6 +191,137 @@ def _parse_listings_from_api(api_responses: list[dict]) -> list[VWListing]:
                     listings.append(listing)
 
     return listings
+
+
+def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> list[VWListing]:
+    """Parse vehicle listings from XHR HTML responses using the browser's DOMParser.
+
+    The VW site loads its search results via an AJAX call to /xhr-results/
+    which returns HTML (not JSON). This function parses that HTML.
+    """
+    all_listings: list[VWListing] = []
+
+    for html_body in xhr_html_bodies:
+        if not html_body or len(html_body) < 500:
+            continue
+
+        raw_listings = page.evaluate(r"""(html) => {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const results = [];
+            const processedHrefs = new Set();
+
+            // Find all links to individual vehicle detail pages.
+            // VW pattern: /en/vehicle_search/volkswagen/{model}/{description}-{id}
+            const allLinks = doc.querySelectorAll('a[href*="/vehicle_search/volkswagen/"]');
+
+            for (const link of allLinks) {
+                const href = link.getAttribute('href') || '';
+                const path = href.split('?')[0];
+                const segments = path.split('/').filter(Boolean);
+
+                // Detail pages have 5+ segments:
+                //   en / vehicle_search / volkswagen / model / detail-id
+                // Search/filter pages have 4:
+                //   en / vehicle_search / volkswagen / model
+                if (segments.length < 5) continue;
+
+                // Skip pagination links (page1, page2, ...)
+                if (/^page\d+$/.test(segments[segments.length - 1])) continue;
+
+                // Deduplicate by path
+                if (processedHrefs.has(path)) continue;
+                processedHrefs.add(path);
+
+                // Walk up to find the card container
+                let card = link;
+                for (let i = 0; i < 8; i++) {
+                    if (!card.parentElement) break;
+                    const parent = card.parentElement;
+                    const parentText = parent.textContent || '';
+                    if (parentText.length > 4000) break;
+                    card = parent;
+                }
+
+                // Use textContent (not innerText — works on parsed docs and
+                // includes text from CSS-hidden elements like prices)
+                const text = card.textContent || '';
+                if (text.length < 20) continue;
+
+                const img = card.querySelector('img');
+                const imgSrc = img
+                    ? (img.getAttribute('src') || img.getAttribute('data-src')
+                       || img.getAttribute('data-lazy') || '')
+                    : '';
+
+                results.push({ text, href: path, imgSrc });
+            }
+
+            return results;
+        }""", html_body)
+
+        logger.info(f"XHR HTML parser found {len(raw_listings)} vehicle cards")
+
+        for raw in raw_listings:
+            text = raw.get("text", "")
+            href = raw.get("href", "")
+            img_src = raw.get("imgSrc", "")
+
+            if href and not href.startswith("http"):
+                href = Config.VW_BASE_URL + href
+
+            price = _extract_price(text)
+            mileage = _extract_mileage(text)
+            year = _extract_year(text)
+
+            fuel_type = ""
+            transmission = ""
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                line_lower = line.lower()
+                if not fuel_type and any(f in line_lower for f in ["petrol", "diesel", "electric", "hybrid"]):
+                    fuel_type = line
+                if not transmission and any(t in line_lower for t in ["manual", "automatic", "dsg", "single speed"]):
+                    transmission = line
+
+            title = ""
+            for line in text.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if "volkswagen" in line.lower() or _detect_model(line):
+                    title = line
+                    break
+            if not title:
+                for line in text.split("\n"):
+                    line = line.strip()
+                    if line and len(line) > 5:
+                        title = line
+                        break
+
+            model = _detect_model(title) or _detect_model(text)
+
+            if price > 500:
+                all_listings.append(VWListing(
+                    title=title,
+                    price=price,
+                    mileage=mileage,
+                    year=year,
+                    fuel_type=fuel_type,
+                    transmission=transmission,
+                    model=model,
+                    trim="",
+                    registration="",
+                    dealer="",
+                    location="",
+                    url=href,
+                    image_url=img_src,
+                ))
+
+    logger.info(f"XHR HTML total: {len(all_listings)} listings with valid prices")
+    return all_listings
 
 
 def _find_vehicle_arrays(data, depth=0) -> list[list[dict]]:
@@ -330,9 +470,11 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
             const key = parts.length > 1 ? '/' + parts[0] + '/' + parts[1] : href.substring(0, 50);
             hrefPatterns[key] = (hrefPatterns[key] || 0) + 1;
         }
-        // Count elements with £ sign
+        // Count elements with £ sign (check both innerText and textContent)
         const body = document.body.innerText || '';
+        const bodyTC = document.body.textContent || '';
         const priceCount = (body.match(/£[\d,]+/g) || []).length;
+        const priceCountTC = (bodyTC.match(/£[\d,]+/g) || []).length;
         const pageTextLen = body.length;
 
         return {
@@ -340,6 +482,7 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
             hrefSamples,
             hrefPatterns,
             priceCount,
+            priceCountTC,
             pageTextLen,
             title: document.title,
         };
@@ -347,24 +490,71 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
 
     logger.info(f"Page diagnostics: title='{diagnostics.get('title', '')}', "
                 f"links={diagnostics.get('totalLinks', 0)}, "
-                f"prices on page={diagnostics.get('priceCount', 0)}, "
+                f"prices(innerText)={diagnostics.get('priceCount', 0)}, "
+                f"prices(textContent)={diagnostics.get('priceCountTC', 0)}, "
                 f"page text length={diagnostics.get('pageTextLen', 0)}")
     for pattern, count in sorted(diagnostics.get("hrefPatterns", {}).items(), key=lambda x: -x[1])[:15]:
         logger.debug(f"  Link pattern: {pattern} ({count}x)")
     for href in diagnostics.get("hrefSamples", [])[:10]:
         logger.debug(f"  Sample href: {href}")
 
-    raw_listings = page.evaluate("""() => {
+    raw_listings = page.evaluate(r"""() => {
         const results = [];
-        const processedTexts = new Set();
+        const processedHrefs = new Set();
 
-        // ── Strategy 1: Link-based ──
-        // Find all links that point to individual vehicle detail pages.
+        // ── Strategy 0: VW-specific — vehicle detail page links ──
+        // VW uses: /en/vehicle_search/volkswagen/{model}/{description}-{id}
+        // Detail pages have 5+ path segments; search pages have 4.
+        const vwLinks = document.querySelectorAll(
+            'a[href*="/vehicle_search/volkswagen/"]'
+        );
+
+        for (const link of vwLinks) {
+            const href = link.getAttribute('href') || '';
+            const path = href.split('?')[0];
+            const segments = path.split('/').filter(Boolean);
+
+            // Detail pages: en/vehicle_search/volkswagen/model/detail = 5+
+            if (segments.length < 5) continue;
+            // Skip pagination (page1, page2, ...)
+            if (/^page\d+$/.test(segments[segments.length - 1])) continue;
+            // Skip finance section links
+            if (href.includes('#vdpSection')) continue;
+
+            if (processedHrefs.has(path)) continue;
+            processedHrefs.add(path);
+
+            // Walk up to find the card container
+            let card = link;
+            for (let i = 0; i < 8; i++) {
+                if (!card.parentElement) break;
+                const parent = card.parentElement;
+                if ((parent.textContent || '').length > 4000) break;
+                card = parent;
+            }
+
+            // Use textContent (works even when prices are CSS-rendered)
+            const text = card.textContent || '';
+            if (text.length < 20) continue;
+
+            const img = card.querySelector('img');
+            const imgSrc = img
+                ? (img.getAttribute('src') || img.getAttribute('data-src')
+                   || img.getAttribute('data-lazy') || '')
+                : '';
+            results.push({ text, href: path, imgSrc, strategy: 0 });
+        }
+
+        if (results.length > 0) return results;
+
+        // ── Strategy 1: Generic link-based ──
+        // Find links that point to individual vehicle detail pages on non-VW sites.
         const vehicleLinks = document.querySelectorAll(
             'a[href*="/vehicle/"], a[href*="/car/"], a[href*="/detail/"], '
           + 'a[href*="/listing/"], a[href*="/used-car/"], a[href*="/approved/"]'
         );
 
+        const processedTexts = new Set();
         for (const link of vehicleLinks) {
             const href = link.getAttribute('href') || '';
             if (href.includes('vehicle_search') || href.includes('vehicle-search')) continue;
@@ -374,15 +564,12 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
             for (let i = 0; i < 6; i++) {
                 if (!card.parentElement) break;
                 const parent = card.parentElement;
-                const parentText = parent.innerText || '';
+                const parentText = parent.textContent || '';
                 if (parentText.length > maxTextLen) break;
                 card = parent;
             }
 
-            const text = card.innerText || '';
-            const fromPriceCount = (text.match(/From\\s+£/gi) || []).length;
-            if (fromPriceCount > 2) continue;
-            if (!text.includes('£')) continue;
+            const text = card.textContent || '';
             if (text.length < 30 || text.length > maxTextLen) continue;
 
             // Dedup by text content (first 200 chars)
@@ -398,10 +585,10 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
         if (results.length > 0) return results;
 
         // ── Strategy 2: Broad element search ──
-        // If link-based strategy found nothing, look for card-like elements
-        // that contain both a price (£) and car-related keywords.
-        const carKeywords = /\\b(volkswagen|vw|id\\.3|id\\.4|id\\.5|id\\.7|id\\. buzz|golf|polo|tiguan|t-roc|t-cross|touareg|touran|tayron|taigo|passat|arteon|up!|e-up|multivan)\\b/i;
-        const pricePattern = /£[\\d,]+/;
+        // Look for card-like elements that contain car-related keywords.
+        const carKeywords = /\b(volkswagen|vw|id[.\-]\s?[34567]|id\. buzz|golf|polo|tiguan|t-roc|t-cross|touareg|touran|tayron|taigo|passat|arteon|up!|e-up|multivan)\b/i;
+        // Look for prices with £ sign OR standalone large numbers (in case £ is CSS-rendered)
+        const pricePattern = /(?:£[\d,]+|[\d,]{4,}\s*(?:price|£))/i;
 
         // Try common card/tile selectors first
         const cardSelectors = [
@@ -428,21 +615,14 @@ def _parse_listings_from_dom(page: Page) -> list[VWListing]:
         }
 
         for (const el of candidateElements) {
-            const text = el.innerText || '';
+            const text = el.textContent || '';
             if (text.length < 30 || text.length > 2000) continue;
-
-            // Must contain a price
-            if (!pricePattern.test(text)) continue;
 
             // Must contain a car-related keyword
             if (!carKeywords.test(text)) continue;
 
-            // Skip navigation/model-picker elements
-            const fromPriceCount = (text.match(/From\\s+£/gi) || []).length;
-            if (fromPriceCount > 2) continue;
-
             // Skip if this contains multiple "miles" entries (likely a container of multiple cards)
-            const milesCount = (text.match(/\\bmiles\\b/gi) || []).length;
+            const milesCount = (text.match(/\bmiles\b/gi) || []).length;
             if (milesCount > 3) continue;
 
             // Dedup by text content (first 200 chars)
@@ -904,9 +1084,10 @@ def _scrape_single_url(page: Page, url: str, cookie_handled: bool) -> tuple[list
 
     page.on("console", on_console)
 
-    # Step 1: Load page and intercept JSON responses + full network log
-    api_responses, network_log = _try_intercept_api(page, url)
+    # Step 1: Load page and intercept JSON/HTML responses + full network log
+    api_responses, xhr_html_bodies, network_log = _try_intercept_api(page, url)
     logger.info(f"Intercepted {len(api_responses)} JSON responses, "
+                f"{len(xhr_html_bodies)} XHR HTML responses, "
                 f"{len(network_log)} total network requests")
     for resp in api_responses:
         resp_url = resp.get("url", "")
@@ -916,10 +1097,16 @@ def _scrape_single_url(page: Page, url: str, cookie_handled: bool) -> tuple[list
     final_url = page.url
     logger.info(f"Final page URL: {final_url}")
 
-    # Step 2: Try to parse vehicle data from API responses
-    listings = _parse_listings_from_api(api_responses)
+    # Step 2a: Try to parse vehicle data from XHR HTML (primary method for VW site)
+    listings = []
+    if xhr_html_bodies:
+        listings = _parse_listings_from_xhr_html(page, xhr_html_bodies)
+
+    # Step 2b: Try API JSON responses as fallback
+    if not listings:
+        listings = _parse_listings_from_api(api_responses)
     if listings:
-        logger.info(f"Parsed {len(listings)} listings from API data")
+        logger.info(f"Parsed {len(listings)} listings from intercepted data")
 
     # Step 3: Handle cookie consent (only on first URL)
     if not cookie_handled:
@@ -930,11 +1117,18 @@ def _scrape_single_url(page: Page, url: str, cookie_handled: bool) -> tuple[list
     # Step 4: Wait for content to render (SPA may load asynchronously)
     # Try to wait for elements that indicate vehicle listings are visible
     page.wait_for_timeout(3000)
-    try:
-        page.wait_for_selector("text=£", timeout=10000)
-        logger.info("Price text detected on page")
-    except PlaywrightTimeout:
-        logger.warning("No '£' price text found on page within 10s — "
+    content_found = False
+    # Try multiple selectors — VW site may not show £ in DOM text
+    for selector in ["text=£", "[class*='vehicle']", "[class*='result'] a[href*='vehicle_search']"]:
+        try:
+            page.wait_for_selector(selector, timeout=5000)
+            logger.info(f"Content detected on page via: {selector}")
+            content_found = True
+            break
+        except PlaywrightTimeout:
+            continue
+    if not content_found:
+        logger.warning("No vehicle content found on page within timeout — "
                        "page may be empty, blocked, or structured differently")
 
     # Step 5: If API didn't have vehicle data, extract from DOM
