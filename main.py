@@ -107,9 +107,13 @@ def main() -> int:
     # Send email
     success = send_email(valuations)
     if not success:
-        logger.error("Failed to send email. Use --no-email to print report to console instead.")
+        logger.warning("Failed to send email report.")
         print(generate_report_text(valuations))
-        return 1
+        if not args.save_html:
+            logger.error("No HTML report was saved either. Use --no-email or --save-html.")
+            return 1
+        logger.info("HTML report was already saved; treating email failure as non-fatal.")
+        return 0
 
     logger.info("Done! Email report sent successfully.")
     return 0

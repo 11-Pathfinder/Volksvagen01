@@ -93,11 +93,12 @@ def _detect_model(text: str) -> str:
     text_lower = text.lower()
     for m in VW_MODELS:
         if m in text_lower:
-            # Preserve canonical casing for ID models
-            if m.startswith("id."):
-                return "ID." + m[3:].upper().strip()
+            # ID. Buzz has special spacing (check before generic id. prefix)
             if m == "id. buzz":
                 return "ID. Buzz"
+            # Preserve canonical casing for ID models: id.3→ID.3, id.7 tourer→ID.7 Tourer
+            if m.startswith("id."):
+                return "ID." + m[3:].strip().title()
             return m.title()
     return ""
 
@@ -351,7 +352,7 @@ def _parse_listings_from_xhr_html(page: Page, xhr_html_bodies: list[str]) -> lis
                     break
 
             transmission = ""
-            for t in ["manual", "automatic", "dsg", "single speed", "auto"]:
+            for t in ["manual", "automatic", "dsg", "single speed"]:
                 if t in text_lower:
                     transmission = t.title()
                     break
@@ -1360,11 +1361,13 @@ def scrape_vw_listings() -> list[VWListing]:
 
     if Config.VW_MAX_MILEAGE:
         max_mileage = int(Config.VW_MAX_MILEAGE)
-        all_listings = [l for l in all_listings if l.mileage <= max_mileage]
+        # Keep listings with mileage=0 (unextracted) — don't discard on missing data
+        all_listings = [l for l in all_listings if l.mileage == 0 or l.mileage <= max_mileage]
 
     if Config.VW_MIN_YEAR:
         min_year = int(Config.VW_MIN_YEAR)
-        all_listings = [l for l in all_listings if l.year >= min_year]
+        # Keep listings with year=0 (unextracted) — don't discard on missing data
+        all_listings = [l for l in all_listings if l.year == 0 or l.year >= min_year]
 
     # Deduplicate by URL
     seen_urls = set()
